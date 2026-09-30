@@ -1,0 +1,7 @@
+.rocks/
+var/
+node_modules/
+.tmp_mutant.*
+*.um.backup.*
+# Шаблоны страниц: HTML с вкраплениями, не Lua.
+**/*.thtml.lua

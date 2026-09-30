@@ -1,0 +1,1494 @@
+# Описание HTTP-API панели — собранное, а не написанное.
+#
+# Файл пишет `make api-spec` (tools/build_api_spec.lua): документ OpenAPI
+# собирает `tnt-openapi` из маршрутов панели, форм `tnt-data`
+# (tnt/admin/app/data пакета tnt-admin) и слов операций
+# (tnt/admin/app/http/openapi.lua и openapi/). Руками его не правят:
+# `make lint-api` сличает файл с документом, собранным заново, и правка
+# формы или слова без пересборки файла роняет сверку.
+#
+# Тело отказа — тоже договор: сверка прогоняет через панель образцы
+# отказов — свой, с разбором полей, ворот, раскатки, поломки, роутера —
+# и сличает их тела со схемами (tools/check_api_spec.lua).
+openapi: 3.0.3
+info:
+  title: Панель кластера Tarantool
+  version: '1'
+  description: |
+    Состояние кластера, находки диагностики, подсказки оператору и действия над узлами.
+
+    Код ответа настоящий: 401 — не вошли, 403 — нет права, 404 — нет такого пути, 405 — сюда
+    так не ходят, 207 — действие удалось не всем. Разбирать текст ошибки не нужно.
+
+    Тело отказа одно на всё API — схема Refusal: error.status — тот же код, error.message —
+    что показать человеку, error.incident — номер записи журнала, если отказ записан как
+    происшествие. Разбор по полям, код ворот, фаза и отчёт раскатки приходят у тех ответов,
+    где они описаны. Отказы до маршрута — 404, 405 с заголовком Allow, тело не в пределах
+    (400, 408, 411, 413) — приходят тем же видом.
+
+    Транспорт панель не шифрует: пароль оператора и слово сборщика метрик идут открытым
+    текстом. В развёртывании панель ставится за обратным прокси с TLS.
+servers:
+  - url: /api/v1
+paths:
+  /actions:
+    post:
+      summary: Выполнить действие на узлах
+      operationId: actions.run
+      description: |
+        Ответ всегда несёт карту «узел — что с ним»: операция на кластере удаётся частично чаще,
+        чем целиком, и повторять её нужно только по неудавшимся узлам.
+
+        Опасное действие требует подтверждения: в теле передаются отпечаток состояния из оценки,
+        признание последствий и слово подтверждения. Отказ ворот приходит с той же оценкой,
+        чтобы было видно, что изменилось.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActionRequest'
+      responses:
+        '200':
+          description: Удалось на всех узлах
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Outcome'
+        '207':
+          description: Удалось не на всех
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Outcome'
+        '400':
+          description: Запрос не разобран или действие отвергнуто. Неверные поля тела названы в error.fields;
+            отказ ворот с незнакомым кодом несёт этот код в error.code и оценку в assessment
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '401':
+          description: Вход не выполнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '403':
+          description: Нет права менять кластер
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '409':
+          description: Состояние изменилось (STALE_FINGERPRINT) — посмотрите оценку заново; не выполнено
+            требование (PRECONDITION_FAILED) — сделайте сначала то, что она называет
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Refusal'
+                  - properties:
+                      error:
+                        required:
+                          - code
+                        properties:
+                          code:
+                            enum:
+                              - STALE_FINGERPRINT
+                              - PRECONDITION_FAILED
+        '428':
+          description: 'Нужно подтверждение: признание последствий и слово. Рядом оценка со словом и
+            отпечатком — их и присылают следующим запросом'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Refusal'
+                  - properties:
+                      error:
+                        required:
+                          - code
+                        properties:
+                          code:
+                            enum:
+                              - CONFIRMATION_REQUIRED
+        '501':
+          description: Действия на этом кластере не включены
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+  /actions/assess:
+    post:
+      summary: Оценить действие до того, как оно сделано
+      operationId: actions.assess
+      description: |
+        Что произойдёт, чего это стоит и что нужно сделать до. Для опасного действия оценка
+        несёт слово подтверждения и отпечаток состояния, по которому потом проверяется, что
+        оператор согласился именно на эту картину, а не на прежнюю.
+
+        Оценка ничего не меняет, но и гостю её не показывают: в ней написано, что именно
+        случится с кластером.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActionRequest'
+      responses:
+        '200':
+          description: Оценка посчитана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Assessment'
+        '400':
+          description: Запрос не разобран или оценка не посчитана. Неверные поля тела названы в error.fields
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '401':
+          description: Вход не выполнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '403':
+          description: Нет права менять кластер
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '501':
+          description: Оценка действий на этом кластере не включена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+  /audit:
+    get:
+      summary: Выгрузить журнал аудита потоком
+      operationId: audit.export
+      description: |
+        Строка на запись (NDJSON), тем же видом, что уезжает в приёмник вывоза: поля записи и
+        оба хеша — prev_hash и current_hash. Принявший проходит цепочку сам, не спрашивая узел:
+        хеш записи — sha256 от хеша предыдущей и её полей (tnt.audit.chain). Пломба (chain_seal)
+        — граница, оставленная очисткой, а не дыра.
+
+        Ответ идёт кусками (Transfer-Encoding: chunked), длины у него нет: в памяти узла лежит
+        один кусок, и медленный клиент тормозит источник. Обрыв источника посреди выгрузки рвёт
+        соединение без завершающего куска — обрезанная выгрузка не выглядит целой. Продолжить
+        оборванную — from_id на единицу больше номера последней принятой строки.
+
+        Выгрузка кончается на голове журнала, которую застала: дописанное после этого в неё не
+        попадает. Отбора по пользователю и времени нет намеренно: участок цепочки с дырами не
+        проверить, а отбирать строки из целого участка принявший умеет сам.
+
+        Читать журнал может только тот, кому приложение выдало право аудита, — право менять
+        кластер его не даёт. Панель без входа открыта целиком, и журнал тоже.
+      parameters:
+        - name: from_id
+          in: query
+          description: С какой записи начать, включительно
+          schema:
+            type: integer
+            maximum: 99999999999999
+            minimum: 1
+        - name: to_id
+          in: query
+          description: На какой закончить, включительно
+          schema:
+            type: integer
+            maximum: 99999999999999
+            minimum: 1
+      responses:
+        '200':
+          description: Журнал кусками, строка на запись
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        '400':
+          description: Участок не разобран или журнал не прочитан. Неверные аргументы названы в error.fields
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '401':
+          description: Вход не выполнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '403':
+          description: Нет права читать журнал аудита
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '501':
+          description: Журнал аудита этой панели недоступен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+  /audit/verify:
+    get:
+      summary: Проверить цепочку хешей журнала аудита на узле
+      operationId: audit.verify
+      description: |
+        Узел пересчитывает хеши записей подряд и сверяет ссылки. Порванная цепочка — ответ 200 с
+        ok: false, номером записи broken_at и причиной reason, а не отказ: проверка сделала своё
+        дело.
+
+        За запрос проверяется не больше budget записей. Кончился бюджет — в отчёте cursor с
+        after_id и hash, и следующий запрос продолжает с него теми же аргументами. Курсор значит
+        «бюджет кончился», а не «записи остались». Если между запросами очистка убрала запись
+        курсора, ответ — отказ 400: проверку надо начать заново.
+
+        Проверка не видит удаления записей с конца журнала и подмены всей цепочки целиком — для
+        этого есть вывоз во второе место.
+      parameters:
+        - name: from_id
+          in: query
+          description: С какой записи начать; вместе с курсором не задаётся
+          schema:
+            type: integer
+            maximum: 99999999999999
+            minimum: 1
+        - name: to_id
+          in: query
+          description: На какой закончить, включительно
+          schema:
+            type: integer
+            maximum: 99999999999999
+            minimum: 1
+        - name: after_id
+          in: query
+          description: Курсор — номер последней проверенной записи
+          schema:
+            type: integer
+            maximum: 99999999999999
+            minimum: 1
+        - name: hash
+          in: query
+          description: Курсор — её хеш; только вместе с after_id
+          schema:
+            type: string
+            pattern: ^[0-9a-fA-F]+$
+        - name: budget
+          in: query
+          description: Сколько записей проверить за запрос
+          schema:
+            type: integer
+            default: 50000
+            maximum: 50000
+            minimum: 1
+      responses:
+        '200':
+          description: Отчёт проверки цепочки журнала аудита
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditReport'
+        '400':
+          description: Аргументы не разобраны или журнал не прочитан. Неверные аргументы и аргументы,
+            противоречащие друг другу, названы в error.fields
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '401':
+          description: Вход не выполнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '403':
+          description: Нет права читать журнал аудита
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '501':
+          description: Журнал аудита этой панели недоступен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+  /capabilities:
+    get:
+      summary: Что умеет этот кластер
+      operationId: capabilities
+      description: 'Панель одна на все кластеры: в одном есть внешний координатор, в другом выборы
+        ядра, в третьем ни того ни другого. Панель спрашивает, а не догадывается.'
+      responses:
+        '200':
+          description: Что умеет кластер под панелью
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Capabilities'
+        '401':
+          description: Вход не выполнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+  /cluster:
+    get:
+      summary: Узлы и репликасеты
+      operationId: cluster
+      responses:
+        '200':
+          description: Представление кластера
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cluster'
+        '401':
+          description: Вход не выполнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+  /config:
+    get:
+      summary: Показать конфигурацию кластера
+      operationId: config.show
+      description: |
+        Что записано в хранилище и что применено на узлах. Гостю не показывается вовсе: в ней
+        состав кластера, учётные записи и адреса.
+
+        Пароли и ключи заменены заглушкой. Тот же текст принимается обратно POST: заглушки
+        восстанавливаются настоящими значениями до сравнения, поэтому сохранить показанное
+        безопасно, а перенести заглушку туда, где значения не было, — отказ.
+      responses:
+        '200':
+          description: Конфигурация прочитана; что в ней, решает приложение, которое её отдаёт
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          description: Конфигурацию не удалось прочитать
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '401':
+          description: Вход не выполнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '403':
+          description: Нет права смотреть конфигурацию
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '501':
+          description: Конфигурация этого кластера панели недоступна
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+    post:
+      summary: Раскатать правку конфигурации
+      operationId: config.apply
+      description: Правка проходит сверку с действующей конфигурацией, проверку на всех узлах, одну
+        запись в хранилище и ожидание схождения.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RolloutRequest'
+      responses:
+        '200':
+          description: Правка доехала до всех узлов; отчёт раскатки — как его собирает приложение
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          description: Запрос не разобран или правка не раскатана. Неверные поля тела названы в error.fields;
+            раскатка, кончившаяся в незнакомой фазе, несёт её в error.phase и отчёт в rollout
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '401':
+          description: Вход не выполнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '403':
+          description: Нет права менять кластер
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '409':
+          description: 'Правка не прошла: ломает топологию (topology), отвергнута узлами (prepare), не
+            записана (commit) или доехала не до всех (converge). На сверке и проверке не записано
+            ничего, а схождение чинится перечитыванием на отставших, а не повтором'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Refusal'
+                  - required:
+                      - rollout
+                    properties:
+                      error:
+                        required:
+                          - phase
+                        properties:
+                          phase:
+                            enum:
+                              - topology
+                              - prepare
+                              - commit
+                              - converge
+        '501':
+          description: Правка конфигурации на этом кластере не включена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+  /instances:
+    get:
+      summary: Узлы, объявленные конфигурацией, по отбору
+      operationId: instances
+      description: |
+        Чтение объявленного, а не применённого: узлы не опрашиваются, и живы ли они, говорит
+        /cluster. Без параметров — все узлы конфигурации, вместе с узлом панели; порядок — по
+        имени.
+
+        Незнакомый параметр, повторённый параметр и пустое имя в списке — отказ: потерянное
+        условие молча расширило бы ответ, и скрипт, выбирающий узлы для действия, задел бы
+        лишние.
+      parameters:
+        - name: groups
+          in: query
+          description: Любая из групп, через запятую
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+              minLength: 1
+        - name: replicasets
+          in: query
+          description: Любой из репликасетов, через запятую
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+              minLength: 1
+        - name: instances
+          in: query
+          description: Любое из имён узлов, через запятую
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+              minLength: 1
+        - name: roles
+          in: query
+          description: Все перечисленные роли, через запятую
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+              minLength: 1
+        - name: sharding_roles
+          in: query
+          description: 'Все перечисленные роли шардирования, через запятую: router, storage. Ребалансировщика
+            по конфигурации не найти — его назначает vshard, и такой отбор отвергается'
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+              minLength: 1
+        - name: labels
+          in: query
+          description: Все перечисленные метки, по одной — labels[zone]=spb
+          style: deepObject
+          explode: true
+          schema:
+            type: object
+            additionalProperties:
+              type: string
+      responses:
+        '200':
+          description: Узлы конфигурации по отбору
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigInstances'
+        '400':
+          description: Отбор не разобран или диагностика отказала. Неверные параметры названы в error.fields;
+            отказ диагностики — ребалансировщик, незнакомая роль шардирования — приходит её
+            словами в error.message
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '401':
+          description: Вход не выполнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '501':
+          description: 'Отбор узлов этой панели недоступен: диагностика (tnt-cluster-health) не установлена
+            или выключена настройкой'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+  /issues:
+    get:
+      summary: Находки диагностики
+      operationId: issues
+      responses:
+        '200':
+          description: Находки диагностики
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Issues'
+        '401':
+          description: Вход не выполнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+  /login:
+    post:
+      summary: Войти в панель
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Сессия выдана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Identity'
+        '400':
+          description: Запрос не разобран. Неверные поля тела названы в error.fields
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '401':
+          description: Неверное имя или пароль
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '429':
+          description: Слишком много неверных догадок. В заголовке Retry-After — через сколько секунд
+            пробовать снова; до этого пароль не проверяется вовсе, чтобы подбор не продолжался
+            под другим кодом ответа
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '501':
+          description: Вход по паролю не включён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+  /metrics:
+    servers:
+      - url: /
+    get:
+      summary: Состояние кластера числами в формате Prometheus
+      operationId: metrics
+      description: 'Вне общего начала путей: это договор со сборщиком, а не часть API панели. Ходит
+        он по /metrics, ждёт текст, а не JSON, и про версии API ничего не знает. Отказ при
+        этом — JSON того же вида, что у всей панели: сборщик его не разбирает, а читает
+        его человек.'
+      responses:
+        '200':
+          description: Выкладка метрик текстом
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          description: Сборщик не назвал себя или назвался не тем
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '501':
+          description: Выкладка на этой панели не включена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+  /overview:
+    get:
+      summary: Всё сразу за один обход кластера
+      operationId: overview
+      description: 'Страница обзора спрашивает именно это: узлы, находки и подсказки собираются по
+        одному снимку, а не тремя обходами подряд.'
+      responses:
+        '200':
+          description: Кластер, находки и подсказки по одному снимку
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Overview'
+        '401':
+          description: Вход не выполнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+  /suggestions:
+    get:
+      summary: Что оператору предлагается сделать
+      operationId: suggestions
+      responses:
+        '200':
+          description: Подсказки оператору
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Suggestions'
+        '401':
+          description: Вход не выполнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        default:
+          description: 'Отказ, не названный у операции: поломка обработчика — 500 с номером происшествия
+            — или тело запроса не в пределах — 400, 408, 411, 413'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+components:
+  schemas:
+    ActionRequest:
+      description: 'Действие над узлами: что сделать, где и подтверждение опасного'
+      type: object
+      required:
+        - action
+        - targets
+      properties:
+        acknowledge:
+          description: Признание последствий опасного действия
+          type: boolean
+          nullable: true
+        action:
+          description: Действие из перечня capabilities
+          type: string
+          minLength: 1
+        answers:
+          description: 'Ответы на требования оценки: что оператор сделал до действия'
+          type: object
+          additionalProperties: {}
+          nullable: true
+        confirm_token:
+          description: Слово подтверждения из оценки
+          type: string
+          nullable: true
+        fingerprint:
+          description: Отпечаток состояния из оценки, по которой согласились
+          type: string
+          nullable: true
+        key:
+          description: 'Ключ нажатия: повтор с тем же ключом узел узнаёт и не выполняет дважды'
+          type: string
+          nullable: true
+        targets:
+          description: Узлы или репликасеты, над которыми его сделать
+          type: array
+          items:
+            type: string
+            minLength: 1
+    Assessment:
+      description: 'Оценка действия: что случится, чего это стоит и что сделать до'
+      type: object
+      required:
+        - action
+        - risk
+        - data_loss
+        - summary
+        - effects
+        - warnings
+        - manual
+        - preconditions
+        - confirm
+        - fingerprint
+      properties:
+        summary:
+          description: Что произойдёт, одной строкой
+          type: string
+        action:
+          description: Что предлагается сделать
+          type: string
+        confirm:
+          description: Подтверждение
+          allOf:
+            - $ref: '#/components/schemas/Confirmation'
+        data_loss:
+          description: Могут ли пропасть подтверждённые записи
+          type: boolean
+        effects:
+          description: Что именно изменится
+          type: array
+          items:
+            type: string
+        fingerprint:
+          description: Отпечаток состояния, по которому сделан вывод
+          type: string
+        manual:
+          description: Что сделать руками до и вместо
+          type: array
+          items:
+            type: string
+        preconditions:
+          description: Что должно быть выполнено
+          type: array
+          items:
+            $ref: '#/components/schemas/Precondition'
+        risk:
+          description: 'Класс риска: safe, caution либо dangerous'
+          type: string
+        warnings:
+          description: Чем это грозит
+          type: array
+          items:
+            type: string
+    AuditCursor:
+      description: 'Откуда продолжить проверку: after_id и hash следующего запроса'
+      type: object
+      required:
+        - after_id
+      properties:
+        after_id:
+          description: Номер последней проверенной записи
+          type: integer
+        hash:
+          description: 'Её хеш: с ним сверяется ссылка следующей'
+          type: string
+          nullable: true
+      additionalProperties: false
+    AuditReport:
+      description: Отчёт проверки цепочки журнала аудита
+      type: object
+      required:
+        - ok
+        - scanned
+        - seals
+      properties:
+        broken_at:
+          description: На какой записи цепочка порвана
+          type: integer
+          nullable: true
+        cursor:
+          description: 'Откуда продолжить: бюджет кончился, а не записи'
+          allOf:
+            - $ref: '#/components/schemas/AuditCursor'
+          nullable: true
+        ok:
+          description: Цела ли цепочка на пройденном участке
+          type: boolean
+        reason:
+          description: Чем порвана
+          type: string
+          nullable: true
+        scanned:
+          description: Сколько записей проверено за запрос
+          type: integer
+        seals:
+          description: Сколько из них пломб очистки
+          type: integer
+    Capabilities:
+      description: Что умеет кластер под панелью
+      type: object
+      required:
+        - version
+        - failover
+        - config_rollout
+        - authenticated
+        - actions
+      properties:
+        version:
+          description: Версия представления
+          type: integer
+        actions:
+          description: Какие действия панель вправе предлагать
+          type: array
+          items:
+            type: string
+        authenticated:
+          description: Включён ли вход по паролю
+          type: boolean
+        config_rollout:
+          description: Умеет ли кластер раскатывать конфигурацию
+          type: boolean
+        failover:
+          description: Есть ли внешний координатор смены лидера
+          type: boolean
+      additionalProperties: false
+    Cluster:
+      description: Представление кластера
+      type: object
+      required:
+        - version
+        - generation
+        - servers
+        - replicasets
+        - summary
+      properties:
+        servers:
+          description: Узлы по имени
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterServer'
+        version:
+          description: 'Версия представления: меняется, когда меняется смысл полей'
+          type: integer
+        summary:
+          description: Сводка
+          allOf:
+            - $ref: '#/components/schemas/ClusterSummary'
+        generation:
+          description: Номер обхода
+          type: integer
+        replicasets:
+          description: Репликасеты по имени
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterReplicaset'
+        retired_read_at:
+          description: Когда список выведенных читался удачно в последний раз
+          type: number
+          nullable: true
+        self_name:
+          description: Узел, который отвечает панели
+          type: string
+          nullable: true
+        taken_at:
+          description: Когда снят снимок, секунды эпохи
+          type: number
+          nullable: true
+      additionalProperties: false
+    ClusterMemory:
+      description: Заполненность памяти узла долями от 0 до 1
+      type: object
+      properties:
+        arena_ratio:
+          description: Занятая доля арены
+          type: number
+          nullable: true
+        items_ratio:
+          description: Занятая доля места под кортежи
+          type: number
+          nullable: true
+        quota_ratio:
+          description: Занятая доля квоты memtx
+          type: number
+          nullable: true
+      additionalProperties: false
+    ClusterReplicaset:
+      description: 'Репликасет: кого назначили и кто пишет на самом деле'
+      type: object
+      required:
+        - name
+        - writers
+        - healthy
+      properties:
+        servers:
+          description: Узлы репликасета
+          type: array
+          items:
+            type: string
+          nullable: true
+        name:
+          description: Имя репликасета
+          type: string
+        active_leader:
+          description: 'Кто пишет на самом деле: первый из писателей'
+          type: string
+          nullable: true
+        healthy:
+          description: Пишет ли ровно один узел
+          type: boolean
+        leader:
+          description: Кого назначил координатор
+          type: string
+          nullable: true
+        writers:
+          description: Узлы, которые пишут; у здорового репликасета он один
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+    ClusterServer:
+      description: Узел кластера по снимку обхода
+      type: object
+      required:
+        - name
+        - status
+        - reachable
+        - writable
+        - memory
+        - config
+      properties:
+        version:
+          description: Версия Tarantool на узле
+          type: string
+          nullable: true
+        name:
+          description: Имя узла
+          type: string
+        clock:
+          description: Часы узла на момент обхода, секунды эпохи
+          type: number
+          nullable: true
+        config:
+          description: Применённая конфигурация
+          allOf:
+            - $ref: '#/components/schemas/ServerConfig'
+        last_seen:
+          description: Когда узел отвечал в последний раз, секунды эпохи
+          type: number
+          nullable: true
+        lifecycle:
+          description: Жизненный цикл узла, если узел о нём сообщает
+          nullable: true
+        lsn:
+          description: Номер последней записи журнала узла
+          type: integer
+          nullable: true
+        memory:
+          description: Заполненность памяти
+          allOf:
+            - $ref: '#/components/schemas/ClusterMemory'
+        message:
+          description: Почему узел не ответил
+          type: string
+          nullable: true
+        reachable:
+          description: Ответил ли узел на последний обход
+          type: boolean
+        replicaset:
+          description: Репликасет узла
+          type: string
+          nullable: true
+        retired:
+          description: Запись о выводе из эксплуатации; нет — узел в строю
+          nullable: true
+        status:
+          description: Состояние узла; unreachable — узел не ответил на обход
+          type: string
+        uptime:
+          description: Сколько секунд узел работает
+          type: number
+          nullable: true
+        uri:
+          description: Адрес, который узел объявил соседям
+          type: string
+          nullable: true
+        writable:
+          description: Пишет ли узел на самом деле, а не по назначению
+          type: boolean
+      additionalProperties: false
+    ClusterSummary:
+      description: Сводка по кластеру
+      type: object
+      required:
+        - total
+        - unreachable
+        - retired
+        - replicasets
+      properties:
+        replicasets:
+          description: Репликасетов всего
+          type: integer
+        retired:
+          description: Сколько выведено из эксплуатации
+          type: integer
+        total:
+          description: Узлов всего
+          type: integer
+        unreachable:
+          description: Сколько не ответило на обход
+          type: integer
+      additionalProperties: false
+    ConfigInstance:
+      description: Узел, объявленный конфигурацией
+      type: object
+      required:
+        - name
+        - replicaset_name
+        - group_name
+        - roles
+        - sharding_roles
+        - labels
+      properties:
+        name:
+          description: Имя узла
+          type: string
+        group_name:
+          description: Группа
+          type: string
+        labels:
+          description: Метки
+          type: object
+          additionalProperties:
+            type: string
+        replicaset_name:
+          description: Репликасет
+          type: string
+        roles:
+          description: Роли
+          type: array
+          items:
+            type: string
+        sharding_roles:
+          description: Роли шардирования
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+    ConfigInstances:
+      description: Узлы конфигурации по отбору
+      type: object
+      required:
+        - instances
+      properties:
+        instances:
+          description: Узлы по имени
+          type: array
+          items:
+            $ref: '#/components/schemas/ConfigInstance'
+      additionalProperties: false
+    Confirmation:
+      description: Что нужно для подтверждения опасного действия
+      type: object
+      required:
+        - required
+      properties:
+        required:
+          description: Нужно ли подтверждение
+          type: boolean
+        acknowledge:
+          description: Последствия, которые оператор признаёт
+          type: string
+          nullable: true
+        token:
+          description: Слово, которое оператор присылает confirm_token
+          type: string
+          nullable: true
+    Identity:
+      description: 'Кто вошёл: личность и её права'
+      type: object
+      properties:
+        audit:
+          description: Читать журнал аудита и проверять его цепочку
+          type: boolean
+          nullable: true
+        readonly:
+          description: 'Только смотреть: ни действий, ни конфигурации'
+          type: boolean
+          nullable: true
+        username:
+          description: Имя оператора
+          type: string
+          nullable: true
+    Issue:
+      description: Находка диагностики
+      type: object
+      required:
+        - id
+        - rule
+        - level
+        - scope
+        - message
+      properties:
+        id:
+          description: 'Опознаватель находки: правило, область, узел'
+          type: string
+        level:
+          description: 'Насколько серьёзно: warning либо critical'
+          type: string
+        message:
+          description: Что не так, словами для человека
+          type: string
+        replicaset:
+          description: Репликасет находки
+          type: string
+          nullable: true
+        rule:
+          description: Правило диагностики
+          type: string
+        scope:
+          description: 'К чему относится: instance, replicaset либо cluster'
+          type: string
+        server:
+          description: Узел находки
+          type: string
+          nullable: true
+      additionalProperties: false
+    Issues:
+      description: Находки диагностики
+      type: object
+      required:
+        - issues
+      properties:
+        issues:
+          description: Находки по порядку
+          type: array
+          items:
+            $ref: '#/components/schemas/Issue'
+      additionalProperties: false
+    LoginRequest:
+      description: Имя и пароль оператора
+      type: object
+      required:
+        - username
+        - password
+      properties:
+        password:
+          description: Пароль оператора
+          type: string
+          writeOnly: true
+        username:
+          description: Имя оператора
+          type: string
+          minLength: 1
+    Outcome:
+      description: 'Чем кончилось действие: карта «узел — что с ним» и сводка'
+      type: object
+      required:
+        - action
+        - status
+        - entries
+        - succeeded
+        - failed
+        - summary
+      properties:
+        summary:
+          description: Одна строка для человека
+          type: string
+        action:
+          description: Что делали
+          type: string
+        entries:
+          description: Что с каждым узлом, по имени
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/OutcomeEntry'
+        failed:
+          description: 'Кому нет: по ним и только по ним действие повторяют'
+          type: array
+          items:
+            type: string
+        status:
+          description: complete — на всех, partial — на части, failed — нигде
+          type: string
+        succeeded:
+          description: Кому удалось
+          type: array
+          items:
+            type: string
+    OutcomeEntry:
+      description: Что действие сделало на одном узле
+      type: object
+      required:
+        - ok
+      properties:
+        err:
+          description: Почему не удалось
+          type: string
+          nullable: true
+        ok:
+          description: Удалось ли на этом узле
+          type: boolean
+        value:
+          description: Что узел вернул
+          nullable: true
+    Overview:
+      description: Кластер, находки и подсказки по одному снимку
+      type: object
+      required:
+        - cluster
+        - issues
+        - suggestions
+      properties:
+        cluster:
+          description: Представление кластера
+          allOf:
+            - $ref: '#/components/schemas/Cluster'
+        issues:
+          description: Находки
+          type: array
+          items:
+            $ref: '#/components/schemas/Issue'
+        suggestions:
+          description: Подсказки
+          type: array
+          items:
+            $ref: '#/components/schemas/Suggestion'
+      additionalProperties: false
+    Precondition:
+      description: Требование, которое оценка проверила до действия
+      type: object
+      required:
+        - ok
+        - label
+      properties:
+        detail:
+          description: Почему это важно
+          type: string
+          nullable: true
+        label:
+          description: Что требуется
+          type: string
+        ok:
+          description: Выполнено ли
+          type: boolean
+    Refusal:
+      description: 'Тело любого отказа панели: своего, ворот, раскатки, поломки и отказа роутера'
+      type: object
+      required:
+        - error
+      properties:
+        assessment:
+          description: 'Оценка, с которой ворота отказали: что изменилось и какое слово ждут'
+          type: object
+          additionalProperties: {}
+          nullable: true
+        error:
+          description: Что случилось
+          allOf:
+            - $ref: '#/components/schemas/RefusalError'
+        rollout:
+          description: 'Отчёт незаконченной раскатки: какие узлы правку приняли, а какие отстали'
+          type: object
+          additionalProperties: {}
+          nullable: true
+      additionalProperties: false
+    RefusalError:
+      description: 'Что случилось: код, фраза для человека и данные к ней'
+      type: object
+      required:
+        - status
+        - message
+      properties:
+        code:
+          description: 'Код ворот, отказавших в действии: по нему видно, какого шага ждут'
+          type: string
+          nullable: true
+        fields:
+          description: 'Разбор тела или строки запроса: поле — что с ним не так'
+          type: object
+          additionalProperties:
+            type: string
+          nullable: true
+        incident:
+          description: Номер записи журнала у происшествия — его называют дежурному
+          type: string
+          nullable: true
+        message:
+          description: 'Что показать человеку: слово источника либо своё, без чужого текста и стека'
+          type: string
+        phase:
+          description: Фаза, на которой кончилась раскатка правки
+          type: string
+          nullable: true
+        status:
+          description: 'Код ответа ещё раз: тело читают и без строки статуса — в журнале, в письме дежурному'
+          type: integer
+      additionalProperties: false
+    RolloutRequest:
+      description: Правка конфигурации кластера
+      type: object
+      required:
+        - text
+      properties:
+        removing:
+          description: 'Узлы, которые правка выводит из состава: вычеркнуть узел и вывести его — разные
+            вещи'
+          type: array
+          items:
+            type: string
+            minLength: 1
+          nullable: true
+        text:
+          description: Новая конфигурация кластера текстом YAML
+          type: string
+          minLength: 1
+    ServerConfig:
+      description: Конфигурация, применённая на узле
+      type: object
+      properties:
+        fingerprint:
+          description: Отпечаток применённой конфигурации
+          type: string
+          nullable: true
+        status:
+          description: Как узел применил конфигурацию
+          type: string
+          nullable: true
+      additionalProperties: false
+    Suggestion:
+      description: Подсказка оператору
+      type: object
+      required:
+        - action
+        - targets
+        - message
+        - reasons
+      properties:
+        action:
+          description: Какое действие предлагается
+          type: string
+        message:
+          description: Что предлагается, словами для человека
+          type: string
+        reasons:
+          description: Находки, из-за которых предлагается
+          type: array
+          items:
+            type: string
+        targets:
+          description: Над какими узлами
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+    Suggestions:
+      description: Подсказки оператору
+      type: object
+      required:
+        - suggestions
+      properties:
+        suggestions:
+          description: Подсказки по порядку
+          type: array
+          items:
+            $ref: '#/components/schemas/Suggestion'
+      additionalProperties: false
